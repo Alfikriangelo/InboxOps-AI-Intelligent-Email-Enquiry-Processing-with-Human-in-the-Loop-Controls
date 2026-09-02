@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # For tests the app can override with sqlite:///:memory:
 
     # LLM - Gemini 3.6 Flash (per user request; current stable)
-    # Supports multiple keys for rotation when one hits quota (20/day free tier -> 2 keys = 40/day)
+    # Supports multiple keys for rotation
     GEMINI_API_KEY: str = ""  # primary key; if empty, service runs in mock mode
     GEMINI_API_KEYS: str = ""  # comma-separated additional keys, e.g. "key1,key2"
     LLM_API_KEY: str = ""  # alias for compatibility
@@ -30,15 +30,15 @@ class Settings(BaseSettings):
     # Deterministic rules
     CONFIDENCE_THRESHOLD: float = 0.85
     HIGH_CONFIDENCE: float = 0.85
-    MAX_RETRIES: int = 2  # reduced from 3 to save RPM (was 3×6=18 calls, now 2×2=4 max)
-    MAX_INPUT_LENGTH: int = 2000  # was 8000 (~2000 tokens) -> 2000 (~500 tokens) to save input tokens
-    MAX_OUTPUT_TOKENS: int = 800  # cap draft + JSON, 350 truncated, 600 still risky for long drafts
+    MAX_RETRIES: int = 3  # per spec: 3 retries with 1s/2s/4s exponential backoff
+    MAX_INPUT_LENGTH: int = 2000  # validated in EnquiryCreateRequest
+    MAX_OUTPUT_TOKENS: int = 1200  # cap draft + JSON, 1200 to avoid truncation of LLM JSON
     RETRY_BASE_DELAY: float = 1.0  # seconds, exponential backoff
-    RATE_LIMIT_RPM: int = 5  # per key per model (Gemini free tier)
+    RATE_LIMIT_RPM: int = 5  # per key per model
     RATE_LIMIT_RPD: int = 20  # per key per model per day
     CACHE_TTL_SECONDS: int = 86400  # 24h hash cache
 
-    # Cost control - deterministic spam patterns (lowercase substrings)
+    # Deprecated: SPAM_KEYWORDS kept only as fallback safety-net, LLM 100% now determines junk (Option B scalable, no manual lists)
     SPAM_KEYWORDS: list[str] = [
         "win lottery",
         "you have won",
@@ -48,6 +48,34 @@ class Settings(BaseSettings):
         "crypto giveaway",
         "double your money",
     ]
+
+    # Real-world routing — scalable via LLM keywords + embedding (Option B). Add team = add entry here, no code change.
+    TEAM_OWNERS: dict[str, str] = {
+        "sales": "owner_sales@beda.id",
+        "support": "owner_support@beda.id",
+        "billing_finance": "owner_finance@beda.id",
+        "partnership": "owner_partnership@beda.id",
+        "operations": "owner_ops@beda.id",
+        "marketing": "owner_marketing@beda.id",
+        "hr": "owner_hr@beda.id",
+        "legal": "owner_legal@beda.id",
+        "triage": "owner_triage@beda.id",
+    }
+
+    TEAM_DESCRIPTIONS: dict[str, str] = {
+        "sales": "sales pricing quote demo product purchase buying enterprise deal discount proposal NDA contract revenue client customer acquisition",
+        "support": "support help bug error not working broken issue ticket login password refund complaint technical assistance troubleshooting helpdesk",
+        "billing_finance": "billing invoice payment finance accounting charge price tax payroll budget cost subscription fee refund overdue",
+        "partnership": "partnership collaboration reseller affiliate integration joint venture channel partner referral alliance ecosystem",
+        "operations": "operations delivery logistics fulfillment supply chain inventory shipping warehouse fulfillment SLA onboarding",
+        "marketing": "marketing campaign press media advertising promotion brand social content SEO event webinar",
+        "hr": "hr recruitment hiring career job vacancy talent interview people culture onboarding employee opportunities openings application employment join team openings career",
+        "legal": "legal compliance contract GDPR privacy terms NDA regulation policy liability agreement",
+        "triage": "general unclear vague insufficient information triage other ambiguous",
+    }
+
+    ROUTING_SIMILARITY_THRESHOLD: float = 0.12  # below this → triage (tunable)
+    LLM_ONLY_CLASSIFICATION: bool = True  # when True, skip deterministic spam/fast-path, LLM 100%
 
     # Frontend / CORS
     FRONTEND_URL: str = "http://localhost:3000"

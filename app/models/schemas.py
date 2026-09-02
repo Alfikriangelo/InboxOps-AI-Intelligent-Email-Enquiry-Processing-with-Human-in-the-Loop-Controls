@@ -3,7 +3,7 @@ Pydantic schemas for API validation and AI structured output validation.
 """
 from enum import Enum
 from typing import Optional, List, Any
-from pydantic import BaseModel, Field, EmailStr, field_validator, ConfigDict
+from pydantic import BaseModel, Field, EmailStr, field_validator, model_validator, ConfigDict
 from datetime import datetime
 
 # ---------- Enums ----------
@@ -18,6 +18,26 @@ class ClassificationEnum(str, Enum):
     junk = "junk"
     insufficient_information = "insufficient_information"
     other = "other"
+
+
+class TeamEnum(str, Enum):
+    """Real-world routing teams — scalable, LLM keywords mapped via embedding (Option B). Add team = add description, no code change."""
+
+    sales = "sales"
+    support = "support"
+    billing_finance = "billing_finance"
+    partnership = "partnership"
+    operations = "operations"
+    marketing = "marketing"
+    hr = "hr"
+    legal = "legal"
+    triage = "triage"
+
+
+class PriorityEnum(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
 
 class ActionTypeEnum(str, Enum):
     CREATE_LEAD = "CREATE_LEAD"
@@ -55,22 +75,39 @@ class AICompany(BaseModel):
     size: Optional[str] = Field(default=None, description="e.g. '200 employees' or null")
 
 class AIAnalysis(BaseModel):
-    """Strict schema the LLM must conform to."""
+    """Strict schema the LLM must conform to — LLM 100% determines classification/keywords/priority; team is derived deterministically via embedding (Option B)."""
+
     classification: ClassificationEnum
     confidence: float = Field(ge=0.0, le=1.0)
     contact: AIContact = Field(default_factory=AIContact)
     company: AICompany = Field(default_factory=AICompany)
     intent: Optional[str] = Field(default=None, description="Brief intent summary or null")
+    intent_keywords: List[str] = Field(default_factory=list, description="3-6 keywords extracted verbatim from message (LLM-generated, no manual lists)")
+    priority: Optional[PriorityEnum] = Field(default=None, description="low|medium|high derived by LLM from urgency cues")
+    suggested_team: Optional[TeamEnum] = Field(default=None, description="Deterministically computed via embedding (Option B); LLM does not set this directly — filled post-validation")
     missing_information: List[str] = Field(default_factory=list)
     recommended_action: ActionTypeEnum
     draft_response: Optional[str] = Field(default=None, description="Draft reply, not auto-sent")
 
-    @field_validator("missing_information", mode="before")
+    @field_validator("missing_information", "intent_keywords", mode="before")
     @classmethod
     def ensure_list(cls, v):
         if v is None:
             return []
         return v
+
+    @field_validator("intent_keywords", mode="after")
+    @classmethod
+    def normalize_keywords(cls, v):
+        if not v:
+            return []
+        cleaned = []
+        for kw in v:
+            if isinstance(kw, str):
+                kw = kw.strip().lower()
+                if kw and kw not in cleaned:
+                    cleaned.append(kw)
+        return cleaned[:6]
 
     model_config = ConfigDict(extra="forbid")
 
@@ -79,8 +116,8 @@ class AIAnalysis(BaseModel):
 class EnquiryCreateRequest(BaseModel):
     source: SourceEnum
     sender_name: str = Field(min_length=1, max_length=255)
-    sender_email: EmailStr
-    message: str = Field(min_length=1, max_length=8000)
+    sender_email: Optional[EmailStr] = Field(default=None, description="Required for email/website, optional for messaging (chat)")
+    message: str = Field(min_length=1, max_length=2000)
 
     @field_validator("sender_name", "message", mode="before")
     @classmethod
@@ -96,11 +133,21 @@ class EnquiryCreateRequest(BaseModel):
             raise ValueError("message must not be empty")
         return v.strip()
 
+    @model_validator(mode="after")
+    def check_email_for_source(self):
+        # email required for email/website, optional for messaging (chat)
+        if self.source in (SourceEnum.email, SourceEnum.website) and not self.sender_email:
+            raise ValueError("sender_email is required for email and website")
+        # normalize empty string to None for messaging
+        if self.sender_email == "":
+            self.sender_email = None
+        return self
+
 class EnquiryResponse(BaseModel):
     id: str
     source: str
     sender_name: str
-    sender_email: str
+    sender_email: Optional[str] = None
     message: str
     processing_status: str
     ai_classification: Optional[str] = None

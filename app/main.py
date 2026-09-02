@@ -9,14 +9,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+from contextlib import asynccontextmanager
+
 from app.core.config import settings
 from app.core.logging import setup_logging, logger
 from app.models.database import create_all_tables, get_db, get_engine
 from app.models.schemas import HealthResponse
 from app.api.enquiries import router as enquiries_router
 from app.api.actions import router as actions_router
+from app.api.teams import router as teams_router
+from app.api.insights import router as insights_router
 
 setup_logging()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create tables on startup (simple for MVP; production would use Alembic migrations)
+    try:
+        create_all_tables()
+        logger.info("Database tables ensured")
+    except Exception as e:
+        logger.error(f"Failed to create tables: {e}")
+        raise
+    yield
+
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -35,6 +52,7 @@ See /docs for interactive API. Frontend at NEXT.js (port 3000) consumes these en
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
 
 # CORS for Next.js frontend
@@ -46,19 +64,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create tables on startup (simple for MVP; production would use Alembic migrations)
-@app.on_event("startup")
-def on_startup():
-    try:
-        create_all_tables()
-        logger.info("Database tables ensured")
-    except Exception as e:
-        logger.error(f"Failed to create tables: {e}")
-        raise
-
 # Routers
 app.include_router(enquiries_router)
 app.include_router(actions_router)
+app.include_router(teams_router)
+app.include_router(insights_router)
 
 # Health
 @app.get("/health", response_model=HealthResponse, tags=["health"])
@@ -109,6 +119,28 @@ def list_companies(limit: int = 50, db: Session = Depends(get_db)):
         {"id": c.id, "name": c.name, "size": c.size, "created_at": c.created_at}
         for c in companies
     ]
+
+@app.delete("/api/v1/crm/contacts/{contact_id}", status_code=204, tags=["crm"])
+def delete_contact(contact_id: str, db: Session = Depends(get_db)):
+    from app.models.database import Contact, Enquiry
+    from app.services.audit_service import log_event
+    contact = db.query(Contact).filter(Contact.id == contact_id).first()
+    if not contact:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Contact not found")
+    # nullify enquiry references (contact_id & duplicate_of_contact_id)
+    db.query(Enquiry).filter(Enquiry.contact_id == contact_id).update({Enquiry.contact_id: None}, synchronize_session=False)
+    db.query(Enquiry).filter(Enquiry.duplicate_of_contact_id == contact_id).update({Enquiry.duplicate_of_contact_id: None}, synchronize_session=False)
+    # delete audit logs for this contact
+    from app.models.database import AuditLog
+    db.query(AuditLog).filter(AuditLog.entity_id == contact_id).delete(synchronize_session=False)
+    try:
+        log_event(db, entity_type="contact", entity_id=contact_id, event_type="CONTACT_DELETED", actor_type="human", actor_id="demo_user", metadata={"email": contact.email})
+    except Exception:
+        pass
+    db.delete(contact)
+    db.commit()
+    return None
 
 @app.get("/", tags=["root"])
 def root():

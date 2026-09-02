@@ -3,7 +3,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 export type EnquiryCreate = {
   source: "email" | "website" | "messaging";
   sender_name: string;
-  sender_email: string;
+  sender_email?: string;
   message: string;
 };
 
@@ -76,4 +76,47 @@ export async function listContacts() {
   const res = await fetch(`${API_URL}/api/v1/crm/contacts`, { cache: "no-store" });
   if (!res.ok) return [];
   return res.json();
+}
+
+export async function getInsightsSummary() {
+  const res = await fetch(`${API_URL}/api/v1/insights/summary`, { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to fetch insights summary");
+  return res.json();
+}
+
+export async function getInsightsRecent(params?: Record<string, string>) {
+  const qs = params ? `?${new URLSearchParams(params).toString()}` : "";
+  const res = await fetch(`${API_URL}/api/v1/insights/recent${qs}`, { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to fetch recent insights");
+  return res.json();
+}
+
+export async function getEnquiryInsight(id: string) {
+  const res = await fetch(`${API_URL}/api/v1/insights/enquiry/${id}`, { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to fetch insight");
+  return res.json();
+}
+
+export async function listTeams() {
+  const res = await fetch(`${API_URL}/api/v1/teams`, { cache: "no-store" });
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function deleteEnquiry(id: string) {
+  const res = await fetch(`${API_URL}/api/v1/enquiries/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Delete failed");
+  }
+  return true;
+}
+
+export async function deleteContact(id: string) {
+  const res = await fetch(`${API_URL}/api/v1/crm/contacts/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Delete failed");
+  }
+  return true;
 }

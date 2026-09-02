@@ -89,3 +89,27 @@ def get_enquiry_audit(enquiry_id: str, db: Session = Depends(get_db)):
         action_logs = db.query(AuditLog).filter(AuditLog.entity_id.in_(action_ids)).order_by(AuditLog.created_at.desc()).all()
         logs = sorted(logs + action_logs, key=lambda x: x.created_at, reverse=True)
     return logs
+
+@router.delete("/{enquiry_id}", status_code=204)
+def delete_enquiry(enquiry_id: str, db: Session = Depends(get_db)):
+    """Delete enquiry (insight) and its actions + audit. Human-in-the-loop: audit logged."""
+    enquiry = db.query(Enquiry).filter(Enquiry.id == enquiry_id).first()
+    if not enquiry:
+        raise HTTPException(status_code=404, detail="Enquiry not found")
+    # collect action ids for audit cleanup
+    action_ids = [a.id for a in db.query(ProposedAction.id).filter(ProposedAction.enquiry_id == enquiry_id).all()]
+    # delete audit logs for enquiry and its actions
+    if action_ids:
+        db.query(AuditLog).filter(AuditLog.entity_id.in_(action_ids)).delete(synchronize_session=False)
+    db.query(AuditLog).filter(AuditLog.entity_id == enquiry_id).delete(synchronize_session=False)
+    # log deletion before commit (detached after delete)
+    from app.services.audit_service import log_event
+    try:
+        log_event(db, entity_type="enquiry", entity_id=enquiry_id, event_type="ENQUIRY_DELETED", actor_type="human", actor_id="demo_user", metadata={"source": enquiry.source})
+    except Exception:
+        pass
+    # cascade will delete proposed_actions via relationship, but explicit delete for safety
+    db.query(ProposedAction).filter(ProposedAction.enquiry_id == enquiry_id).delete(synchronize_session=False)
+    db.delete(enquiry)
+    db.commit()
+    return None

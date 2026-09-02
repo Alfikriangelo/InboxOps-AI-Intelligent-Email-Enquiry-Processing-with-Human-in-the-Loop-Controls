@@ -7,7 +7,7 @@ from app.models.database import AuditLog, get_engine
 from app.core.logging import logger
 from datetime import datetime, timezone
 
-# Event types per spec
+# Event types per spec (+ NOTIFICATION_QUEUED for alerting requirement)
 EVENT_TYPES = [
     "ENQUIRY_RECEIVED",
     "AI_ANALYSIS_STARTED",
@@ -15,6 +15,7 @@ EVENT_TYPES = [
     "AI_ANALYSIS_FAILED",
     "DUPLICATE_DETECTED",
     "ACTION_CREATED",
+    "NOTIFICATION_QUEUED",
     "ACTION_APPROVED",
     "ACTION_REJECTED",
     "ACTION_EXECUTED",

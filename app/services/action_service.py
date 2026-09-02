@@ -55,12 +55,46 @@ def create_proposed_action(
     if duplicate_status in ("exact_match", "possible_duplicate") and recommended == ActionTypeEnum.CREATE_LEAD.value:
         recommended = ActionTypeEnum.UPDATE_CONTACT.value if duplicate_status == "exact_match" else recommended
 
+    # Option B routing: suggested_team derived deterministically via embedding from LLM keywords+intent (no manual lists)
+    suggested_team = getattr(analysis, "suggested_team", None)
+    if hasattr(suggested_team, "value"):
+        suggested_team_val = suggested_team.value
+    else:
+        suggested_team_val = str(suggested_team) if suggested_team else None
+    # Fallback to routing_service if not already set (e.g., direct mock without enrichment) — include source (Opsi A)
+    if not suggested_team_val:
+        try:
+            from app.services.routing_service import route_team
+
+            q = " ".join(getattr(analysis, "intent_keywords", []) or []) + " " + (getattr(analysis, "intent", "") or "")
+            routed = route_team(
+                q.strip() or getattr(analysis, "intent", "") or str(getattr(analysis, "classification", "other")),
+                getattr(analysis, "classification", None),
+                source=enquiry.source,
+            )
+            suggested_team_val = routed.value if hasattr(routed, "value") else str(routed)
+        except Exception:
+            suggested_team_val = "triage"
+    # Resolve owner deterministically
+    try:
+        from app.services.routing_service import get_team_owner
+        from app.models.schemas import TeamEnum
+
+        team_enum = TeamEnum(suggested_team_val) if suggested_team_val else TeamEnum.triage
+        assigned_owner = get_team_owner(team_enum)
+    except Exception:
+        assigned_owner = "owner_triage@beda.id"
+
     metadata = {
         "classification": getattr(analysis.classification, "value", str(analysis.classification)) if hasattr(analysis, "classification") else str(analysis.classification),
         "confidence": confidence,
         "low_confidence_flag": low_conf_flag,
         "missing_information": getattr(analysis, "missing_information", []),
         "intent": getattr(analysis, "intent", None),
+        "intent_keywords": getattr(analysis, "intent_keywords", []),
+        "priority": getattr(analysis, "priority", None).value if hasattr(getattr(analysis, "priority", None), "value") else getattr(analysis, "priority", None),
+        "suggested_team": suggested_team_val,
+        "assigned_owner": assigned_owner,
         "contact": getattr(analysis, "contact", {}).model_dump() if hasattr(getattr(analysis, "contact", {}), "model_dump") else getattr(analysis, "contact", {}),
         "company": getattr(analysis, "company", {}).model_dump() if hasattr(getattr(analysis, "company", {}), "model_dump") else getattr(analysis, "company", {}),
         "duplicate_status": duplicate_status,

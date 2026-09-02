@@ -4,6 +4,7 @@ Main enquiry processing flow:
 
 Mirrors spec's example process_enquiry function. Deterministic code owns control.
 """
+from typing import Optional
 from sqlalchemy.orm import Session
 from app.models.database import Enquiry
 from app.models.schemas import AIAnalysis
@@ -13,16 +14,25 @@ from app.services.action_service import create_proposed_action
 from app.core.config import settings
 from app.core.logging import logger
 
-def process_enquiry(db: Session, source: str, sender_name: str, sender_email: str, message: str):
+def process_enquiry(db: Session, source: str, sender_name: str, sender_email: Optional[str], message: str):
     """
     Synchronous processing for MVP (spec allows sync; production could use queue/worker).
     Returns (enquiry, proposed_action)
     """
-    # 1. Save raw enquiry
+    # 1. Save raw enquiry - email optional for messaging (chat)
+    normalized_email: Optional[str] = None
+    if sender_email and str(sender_email).strip():
+        normalized_email = str(sender_email).strip().lower()
+    elif source == "messaging":
+        # fallback placeholder for chat without email (keep DB NOT NULL happy)
+        safe_name = (sender_name or "anonymous").strip().lower().replace(" ", "_")[:20] or "anonymous"
+        normalized_email = f"{safe_name}@chat.local"
+    else:
+        normalized_email = ""
     enquiry = Enquiry(
         source=source,
         sender_name=sender_name.strip(),
-        sender_email=sender_email.strip().lower(),
+        sender_email=normalized_email or "",
         message=message.strip(),
         processing_status="PENDING",
     )
@@ -37,7 +47,7 @@ def process_enquiry(db: Session, source: str, sender_name: str, sender_email: st
         event_type="ENQUIRY_RECEIVED",
         actor_type="system",
         actor_id="system",
-        metadata={"source": source, "sender_email": sender_email},
+        metadata={"source": source, "sender_email": normalized_email},
     )
     audit_service.log_event(
         db,
@@ -54,7 +64,7 @@ def process_enquiry(db: Session, source: str, sender_name: str, sender_email: st
         ai_service = get_ai_service()
         analysis: AIAnalysis = ai_service.analyse(
             sender_name=sender_name,
-            sender_email=sender_email,
+            sender_email=normalized_email or "",
             message=message,
             source=source,
         )
@@ -108,7 +118,13 @@ def process_enquiry(db: Session, source: str, sender_name: str, sender_email: st
         event_type="AI_ANALYSIS_COMPLETED",
         actor_type="ai",
         actor_id=ai_service.model_name if not ai_service.is_mock else "mock",
-        metadata={"classification": enquiry.ai_classification, "confidence": enquiry.ai_confidence},
+        metadata={
+            "classification": enquiry.ai_classification,
+            "confidence": enquiry.ai_confidence,
+            "intent_keywords": getattr(analysis, "intent_keywords", []),
+            "priority": getattr(analysis, "priority", None).value if hasattr(getattr(analysis, "priority", None), "value") else getattr(analysis, "priority", None),
+            "suggested_team": getattr(analysis, "suggested_team", None).value if hasattr(getattr(analysis, "suggested_team", None), "value") else getattr(analysis, "suggested_team", None),
+        },
     )
 
     # 4. Confidence threshold check (deterministic rule)
@@ -120,7 +136,7 @@ def process_enquiry(db: Session, source: str, sender_name: str, sender_email: st
     # 5. Duplicate detection (deterministic)
     duplicate_status, duplicate_contact = duplicate_detector.find_duplicate(
         db,
-        email=analysis.contact.email or sender_email,
+        email=analysis.contact.email or normalized_email,
         phone=analysis.contact.phone,
         name=analysis.contact.name or sender_name,
         company=analysis.company.name if analysis.company else None,
@@ -138,6 +154,22 @@ def process_enquiry(db: Session, source: str, sender_name: str, sender_email: st
         duplicate_status=duplicate_status,
         duplicate_contact=duplicate_contact,
     )
+
+    # 6b. Deterministic notifier: alert right person via LLM keywords → embedding routing (Option B, no manual lists)
+    try:
+        from app.services.notifier import queue_notification
+
+        meta = proposed_action.metadata_ or {}
+        queue_notification(
+            db,
+            enquiry.id,
+            proposed_action.id,
+            proposed_action.action_type,
+            assigned_owner=meta.get("assigned_owner"),
+            suggested_team=meta.get("suggested_team"),
+        )
+    except Exception as ne:
+        logger.warning(f"Notifier failed (non-blocking): {ne}")
 
     # 7. Mark enquiry as completed processing (action pending)
     enquiry.processing_status = "COMPLETED"
