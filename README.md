@@ -49,7 +49,7 @@ flowchart TD
     M --> N[Insights Dashboard]
 ```
 
-**Data flow (14 steps, sync MVP):** `1 validate → 2 save raw PENDING → 3 audit RECEIVED/STARTED → 4 cache hash 24h (0 calls) → 5 throttle 60/RATE_LIMIT_RPM → 6 Gemini LLM 100% JSON (classification/confidence/contact/company/intent/keywords/priority/missing/action/draft + source context) → 7 Pydantic validate + 3×1s/2s/4s retry/rotate/fallback mock → 8 enrich routing TF-IDF cosine vs 9 real teams threshold 0.12→triage → 9 store AI output → 10 confidence<0.85 flag → 11 duplicate → 12 create PENDING_APPROVAL + NOTIFICATION_QUEUED → 13 return → 14 human approve/reject → deterministic CRM → delete supported for insights/customers` — full trace in `## Data Flow`.
+**Data flow (14 steps, sync MVP):** `1 validate → 2 save raw PENDING → 3 audit RECEIVED/STARTED → 4 cache hash 24h (0 calls) → 5 throttle 60/RATE_LIMIT_RPM → 6 Gemini LLM 100% JSON (classification/confidence/contact/company/intent/keywords/priority/missing/action/draft + source context) → 7 Pydantic validate + 3×1s/2s/4s retry/rotate/fallback mock → 8 enrich routing TF-IDF cosine vs 9 real teams threshold 0.12→triage → 9 store AI output → 10 confidence<0.85 flag → 11 duplicate → 12 create PENDING_APPROVAL + NOTIFICATION_QUEUED → 13 return → 14 human approve/reject → deterministic CRM → delete supported for insights/customers`.
 
 ### 2. Model & Tool Choices and Why
 
@@ -67,7 +67,6 @@ flowchart TD
 | LLM (Gemini 3.6 Flash) | Deterministic Code |
 |---|:---:|
 | Understand unstructured text, classify `sales/support/junk/needs more info/other` (100%), extract `contact/company/intent/keywords/priority/missing`, recommend action, generate varied `draft_response` (HR-aware, not budget for career) | Validate inputs & AI outputs, confidence gate `<0.85`, duplicate detection, TF-IDF routing, CRM writes, approval enforcement, retries/cache/throttler, audit, secrets, insights aggregation |
-| See `## LLM vs Deterministic Code` table for full matrix. | |
 
 **Principle:** LLM recommends, deterministic controls, human approves.
 
@@ -180,210 +179,6 @@ docker-compose up -d   # else set DATABASE_URL=postgresql+psycopg2://...
 
 ---
 
-## Architecture
-
-```mermaid
-flowchart TD
-    A[Email / Website Form / Chat Message] --> B[FastAPI Ingestion API]
-    B --> C[Validation & Normalization 2000 chars]
-    C --> D[(PostgreSQL via SQLAlchemy)]
-    C --> E[AI Analysis Service - Gemini 3.6 Flash LLM 100%]
-    E --> F[Classification & Extraction<br/>intent + key topics + priority]
-    F --> G[Pydantic Validation extra=forbid]
-    G --> H[Routing Service<br/>TF-IDF embedding source-aware<br/>team vs keywords+intent]
-    H --> I[Duplicate Detection<br/>exact email/phone, possible name+company]
-    I --> J[Proposed Action<br/>PENDING_APPROVAL + draft]
-    J --> K{Human Approval Required?}
-    K -->|Yes| L[Pending Approval]
-    L --> M[Human Reviewer - Minimal UI]
-    M -->|Approve| N[Deterministic Action Executor]
-    M -->|Reject| O[Rejected]
-    N --> P[CRM Database Update]
-    O --> Q[Audit Log]
-    P --> Q
-    P --> R[Insights Aggregator]
-    E --> Q
-    H --> Q
-    I --> Q
-```
-
-**Detailed:** [`docs/architecture.md`](docs/architecture.md) • **Decisions:** [`docs/decisions.md`](docs/decisions.md)
-
----
-
-## Data Flow
-
-```
-POST /api/v1/enquiries {source, sender_name, sender_email, message}
-  │
-  ├─ 1. Pydantic validate + normalize (strip, lowercase email, 2000 char limit)
-  ├─ 2. Save raw enquiry (enquiries table, processing_status=PENDING)
-  ├─ 3. Audit ENQUIRY_RECEIVED + AI_ANALYSIS_STARTED
-  ├─ 4. Cache hit? → hash(email|source|message) 24h TTL → return cached (0 tokens/calls)
-  ├─ 5. Rate throttler → waits 60/RATE_LIMIT_RPM per key before LLM call
-  ├─ 6. Gemini 3.6 Flash — LLM 100% determines classification (prompt includes source context: email formal / website lead / chat urgent)
-  │     Returns strict JSON: classification, confidence, contact, company, intent, intent_keywords[3-6], priority, missing_information, recommended_action, draft_response
-  ├─ 7. Pydantic validate AI output (extra="forbid", confidence 0.0-1.0, priority enum, max 6 keywords); on invalid JSON/rate limit: retry 3× exponential backoff (1s/2s/4s) with key rotation
-  │     • Rate limit → mark key exhausted 24h and rotate, fallback to mock if all exhausted
-  │     • Invalid JSON → extract {.*} fallback, then fallback to mock
-  ├─ 8. On failure after retries → fallback to mock (not FAILED) + AI_ANALYSIS_COMPLETED(mock); if mock fails → FAILED
-  ├─ 9. Enrich routing: keywords+intent+classification+source → TF-IDF cosine vs TEAM_DESCRIPTIONS (9 real-world teams) → suggested_team + assigned_owner (threshold 0.12 → triage)
-  ├─10. On success: store ai_classification/confidence/ai_output (with keywords/priority/team); AI_ANALYSIS_COMPLETED
-  ├─11. Confidence < 0.85? → flag low_confidence in metadata (still PENDING_APPROVAL)
-  ├─12. Duplicate detection (exact phone/email → exact_match; name+company → possible_duplicate)
-  ├─13. Create proposed_actions (status=PENDING_APPROVAL, requires_human_approval=true, metadata includes team/owner/keywords/priority) + ACTION_CREATED + DUPLICATE_DETECTED + NOTIFICATION_QUEUED (alert right person, not auto-send)
-  └─14. Return {enquiry, proposed_action, duplicate_status}
-        → UI shows Smart Analysis: Customer Need, Key Topics, Responsible Team, Person in Charge, Priority Level, Still Needs, Suggested Reply
-        → Human: POST /api/v1/actions/{id}/approve|reject
-             • approve: check PENDING, log ACTION_APPROVED, deterministic execute (create company/contact etc), log ACTION_EXECUTED, status=EXECUTED
-             • reject: status=REJECTED, ACTION_REJECTED, never executes
-        → Insight stays viewable: GET /api/v1/insights/enquiry/{id} and Insights tab (summary + recent)
-```
-
-**Sync for MVP** — production could be `API → Queue → Worker → Async`. Source is not an `if source==` branch; it is an **embedding feature** that biases routing via TF-IDF (Opsi A).
-
----
-
-## Model and Tool Choices
-
-**Why LLM (Gemini 3.6 Flash) — LLM 100% scalable?**
-- Understands unstructured free-text, classifies intent, extracts entities, **generates key topics (3-6 verbatim) + priority (low/medium/high)** — tasks where hard-coded keyword lists fail to scale. Add a team = add one description in `TEAM_DESCRIPTIONS`, no code change.
-- 3.6 Flash = latest stable (API confirms 2.0/1.5 no longer available `404 use 3.6-flash`), small/efficient, low latency, cheap; prompt instructs `null` when unknown to avoid hallucination and respects `source` context.
-- **LLM 100% classification** (`LLM_ONLY_CLASSIFICATION=True`): no manual `SPAM_KEYWORDS` gate for routing. LLM determines `junk/insufficient/support/sales` directly; deterministic only validates enum.
-- **Multi-key rotation** via `GEMINI_API_KEYS` comma-separated (`app/core/config.py:67`, `app/services/ai_service.py:352`): on rate limit errors mark key exhausted 24h and rotate with retry. Deduped and configurable.
-- Prompt compacted 800→400 tokens (`SYSTEM_PROMPT` `ai_service.py:20`) + `MAX_INPUT 2000` + `MAX_OUTPUT 800` to control input cost; extended with `intent_keywords/priority` and source hint.
-- Abstracted via `app/services/ai_service.py` (interface, not coupled); swap provider by replacing service.
-
-**Why deterministic code?**
-- Permissions, validation, confidence gate, duplicate detection, TF-IDF routing, CRM writes, approval enforcement, retries, audit, secrets, cache, rate limiter — must be **reproducible, testable, auditable**, not probabilistic.
-
-**Why PostgreSQL (via SQLAlchemy)?**
-- Spec requirement; ACID, JSON columns for flexible metadata, indexes for email/phone. SQLite default for zero-setup local/tests — same SQLAlchemy models, no code fork.
-
-**Why human approval?**
-- Consequential actions (create contact, send email, merge records) are irreversible/binding. Human retains control; LLM only recommends.
-
-**Why Next.js frontend (minimal, layperson)?**
-- Spec: `/docs` suffices; optional minimal UI. We provide **minimal black & white, English, friendly for everyday users** dashboard (New / Queue / Insights / History / Activity Log / Customers) — white bg, black text, no underscores, full words (“Customer Need” not “intent”, “Key Topics” not “intent_keywords”, “Responsible Team” not “suggested_team”, “Billing and Finance” not “billing_finance”).
-
-**Why FastAPI + Pydantic + SQLAlchemy?**
-- FastAPI: auto OpenAPI at `/docs`, Pydantic integration, async-ready.
-- Pydantic: strict schema for both API inputs and AI outputs.
-- SQLAlchemy 2.0: typed Mapped models, pool handling for PG & SQLite.
-
----
-
-## LLM vs Deterministic Code
-
-| Responsibility | LLM (Gemini 3.6 Flash) | Deterministic Code |
-|---|:---:|:---:|
-| Understand unstructured enquiry | **Yes** | No |
-| Classification (`sales/support/junk/needs more info/other`) | **Yes (100%)** | **Validation only** (no manual keyword gate) |
-| Extract information (name/email/phone/company/size + customer need + key topics + priority level) | **Yes** (topics verbatim from message) | **Validation** (Pydantic, null enforcement, max 6 topics) |
-| Identify still needs | **Yes** | Flag + surface to human |
-| Recommend next step | **Yes** (suggestion) | **Controls** (maps to allowed enum, decides final type) |
-| Route to real-world team (`Sales/Support/Billing and Finance/Partnership/Operations/Marketing/Human Resources/Legal/General Support`) | **Yes** (key topics + customer need via TF-IDF embedding Option B) | **Yes** — embedding cosine vs `TEAM_DESCRIPTIONS` (`routing_service.py:45`), threshold 0.12 → General Support; `TEAM_OWNERS` mapping; source augments query (Opsi A) |
-| Suggest reply | **Yes** | **Not sent** — stores draft, human approves |
-| Send externally binding communication | No | **Human approval required** |
-| Duplicate detection | No | **Yes** (exact email/phone, possible name+company) |
-| Permission / confidence checks | No | **Yes** (0.85 threshold, needs review flag) |
-| Customer records (`contacts`, `companies`) | No | **Yes** (deterministic executor after approve) |
-| Merge customer records | No | **No** — blocked; human review required |
-| Retry / backoff / failure handling | No | **Yes** (3× 1s/2s/4s + JSON fallback to mock) |
-| Cache (24h hash) / Throttler | No | **Yes** (`ai_service.py:92`, throttler uses `RATE_LIMIT_RPM`) |
-| Audit + insights | No | **Yes** (stores responsible team / key topics / priority / person in charge) |
-| Access secrets | No | **Yes** (least privilege, never in logs) |
-
----
-
-## Failure Handling
-
-- **Still needs info** (`"Hi, I'm interested"`): LLM returns `needs more info` with `still needs: ["company","business need","contact details"]`, `Ask for More Details`, draft clarification — marked `Waiting for Review`, never auto-sent. Tested in mock + live.
-- **Hallucination prevention**: Prompt says “return `null` when not available, never invent”. Pydantic `extra="forbid"` + `null` enforcement + validation retry; source is light context, not override.
-- **Duplicate records**: Exact `email`/`phone` normalized → `exact match` → propose `Update Customer`; `name+company` normalized/similarity → `possible duplicate` → human review before merge; LLM cannot merge.
-- **Model failure / invalid JSON / timeout / rate limit** (3 retries, exponential backoff 1s/2s/4s per spec): 
-  - `Unterminated string` / `Expecting ','` → robust JSON extract `re.search(r"\{.*\}", DOTALL)` + fix, then fallback to mock (not error). Returns `201` mock on fallback.
-  - Rate limit → mark key exhausted 24h, rotate to next key, fallback to mock if all exhausted.
-  - After 3 retries `processing_status=FAILED` only if mock also fails; else `Done` with mock.
-- **Low confidence**: `<0.85` flagged in `low confidence flag`; step still waiting for review.
-- **Rejection**: `Rejected` status; executor checks `Waiting for Review` only — rejected never executes (tested).
-
----
-
-## Security
-
-- **Secrets**: via `GEMINI_API_KEYS` (comma-separated), `GEMINI_MODEL`, `DATABASE_URL`, `TEAM_OWNERS` in `.env` / env vars; `.env.example` placeholder; never hard-coded, never in responses/logs. `audit_service` redacts keys (`***REDACTED***`).
-- **Permissions**: `action_service.approve` checks `Waiting for Review`; placeholder `actor_id=demo_user` with comment that production uses RBAC/OAuth; least privilege (AI cannot access secrets, delete, merge, send, or use tools via `routing_service` — team is embedding, not tool).
-- **Sensitive data**: Email/phone normalized but not exposed beyond need; audit `metadata` sanitized.
-- **Validation**: All inputs via `EnquiryCreateRequest` (valid email, 1-2000 chars, channel enum); AI output via `AIAnalysis` (key topics max 6, priority enum, responsible team validated).
-- **CORS**: Limited to `FRONTEND_URL` / `CORS_ORIGINS`.
-
----
-
-## Cost and Latency
-
-**How this project keeps cost predictable:**
-- **Cache**: `hash(email|channel|message)` 24h TTL (`CACHE_TTL_SECONDS 86400`, max 500) → repeated messages cost 0 calls.
-- **Throttler**: waits `60 / RATE_LIMIT_RPM` per key before each LLM call.
-- **Key rotation**: on rate limit errors mark key exhausted 24h and rotate to next key. When all keys exhausted → mock fallback.
-- **Prompt & tokens**: compact prompt (~400 tokens) + `MAX_INPUT 2000` + `MAX_OUTPUT 800` to control token usage.
-- **Input caps**: `MAX_INPUT_LENGTH=2000` truncates before LLM.
-- **Latency**: Sync MVP (~1–2s incl. LLM, throttled if burst); production path noted as `Message Queue + Worker + Async`.
-
-**Tune for your case:** set `RATE_LIMIT_RPM`/`RPD` and `GEMINI_API_KEYS` via `.env`; keep `MAX_INPUT_LENGTH`/`MAX_OUTPUT_TOKENS` as is unless you need longer drafts.
-
----
-
-## Deliberately Not Automated
-
-> **The system deliberately refuses to autonomously send externally binding communications or perform irreversible customer changes without appropriate human approval.**
-
-Specifically: drafts are stored, never emailed; `Create New Customer`/`Update Customer`/`Create Support Ticket` execute only after `POST /actions/{id}/approve`; `Rejected` never executes; merging requires human review; even with cache, rate-limit exhausted still falls back to mock, never auto-sends. Source and keyword routing never auto-act — they only suggest.
-
----
-
-## Pseudocode — Approval Gate (Critical Part, current)
-
-```python
-# app/services/enquiry_processor.py:14 + ai_service.py:231 + routing_service.py:45 + action_service.py:58
-def process_enquiry(enquiry):
-    save_raw(enquiry)  # enquiries Waiting
-    audit("Enquiry Received", channel=enquiry.source)
-
-    if cached := cache.get(hash(enquiry)):  # 0 tokens
-        analysis = cached
-    else:
-        throttle(key)  # waits 60 / RATE_LIMIT_RPM
-        raw = gemini_3_6_flash(enquiry)  # LLM 100% — includes source context
-        analysis = AIAnalysis.model_validate(raw)  # extra=forbid, priority enum, max 6 topics
-        analysis.suggested_team = route_team(  # Option B + Opsi A
-            query=" ".join(analysis.intent_keywords) + " " + analysis.intent,
-            classification=analysis.classification,
-            source=enquiry.source,  # email formal / website lead / chat urgent augments embedding
-        )
-
-    if analysis.confidence < 0.85:
-        flag_needs_review()
-
-    duplicate = find_duplicate(email, phone, name, company)  # deterministic
-
-    proposed = create_action(
-        enquiry, analysis, duplicate,
-        status="Waiting for Review",
-        requires_human_approval=True,  # even if 0.95
-        team=analysis.suggested_team, owner=TEAM_OWNERS[team]
-    )
-    audit("Next Step Created", team=team, owner=owner)
-    audit("Notification Queued", assigned_to=owner)  # alert right person, not send to customer
-    return proposed
-
-# Human must approve:
-# POST /actions/{id}/approve -> check Waiting -> deterministic execute -> audit Done
-# POST /actions/{id}/reject  -> Rejected (never executes)
-```
-
----
-
 ## Prototype Scope
 
 This repository **intentionally implements the critical control path** rather than building a full customer system or unnecessary infrastructure:
@@ -474,7 +269,7 @@ To test source effect manually: create same message with `source=email` vs `sour
 | `CONFIDENCE_THRESHOLD` | `0.85` | Needs review flag |
 | `MAX_RETRIES` | `3` | Per spec 1s/2s/4s exponential backoff |
 | `MAX_INPUT_LENGTH` | `2000` | Truncate before LLM |
-| `MAX_OUTPUT_TOKENS` | `800` | Max output tokens for LLM response |
+| `MAX_OUTPUT_TOKENS` | `1200` | Max output tokens for LLM response |
 | `RATE_LIMIT_RPM` | `5` | Requests per minute per key → throttler waits `60/RPM` |
 | `RATE_LIMIT_RPD` | `20` | Requests per day per key → rotation marks exhausted 24h per key |
 | `CACHE_TTL_SECONDS` | `86400` | 24h hash cache (0 calls on hit) |
